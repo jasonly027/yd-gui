@@ -1,0 +1,15 @@
+[package]
+name = "yd-gui"
+version = "0.1.0"
+authors = ["Jason Ly <81354745+jasonly027@users.noreply.github.com>"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+dioxus = { version = "0.5", features = ["desktop", "router"] }
+
+# Debug
+tracing = "0.1.40"
+dioxus-logger = "0.5.0"
