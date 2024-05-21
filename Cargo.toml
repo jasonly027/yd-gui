@@ -13,3 +13,8 @@ dioxus = { version = "0.5", features = ["desktop", "router"] }
 # Debug
 tracing = "0.1.40"
 dioxus-logger = "0.5.0"
+sqlx = { version = "0.7.4", features = ["runtime-tokio", "tls-native-tls", "sqlite", "migrate"] }
+tokio = { version = "1.37.0", features = ["full"] }
+thiserror = "1.0.60"
+anyhow = "1.0.84"
+const_format = "0.2.32"
