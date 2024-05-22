@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use const_format::formatcp;
 use sqlx::{migrate::MigrateError, sqlite::SqliteConnectOptions, Result as sqlxResult, *};
 
-use crate::video::{VideoFormat, VideoInfo};
+use crate::video::VideoInfo;
 
 pub struct Database<DB: sqlx::database::Database> {
     pool: Pool<DB>,
@@ -83,22 +83,30 @@ const HEIGHT: &str = "height";
 const FPS: &str = "fps";
 const VIDEO_INFO_ID: &str = "video_info_id";
 
+const QUERY_VIDEO_INFO: &str = formatcp!(
+    "INSERT INTO {VIDEO_INFO}
+        ({VIDEO_ID}, {TITLE}, {AUTHOR},
+            {DURATION_SECONDS}, {THUMBNAIL}, {AUDIO_AVAILABLE})
+     VALUES
+        ($1, $2, $3,
+            $4, $5, $6)
+     RETURNING
+        {ID}
+    "
+);
+const QUERY_VIDEO_FORMAT: &str = formatcp!(
+    "INSERT INTO {VIDEO_FORMAT}
+        ({CONTAINER}, {WIDTH}, {HEIGHT}, {FPS}, {VIDEO_INFO_ID})
+        VALUES
+        ($1, $2, $3, $4, $5)
+    "
+);
+
 impl Database<Sqlite> {
     pub async fn insert_video_info(&self, video_info: &VideoInfo) -> sqlxResult<i32> {
         let mut transaction = self.get_transaction().await?;
 
         // Insertion into video_info table
-        const QUERY_VIDEO_INFO: &str = formatcp!(
-            "INSERT INTO {VIDEO_INFO}
-                ({VIDEO_ID}, {TITLE}, {AUTHOR},
-                    {DURATION_SECONDS}, {THUMBNAIL}, {AUDIO_AVAILABLE})
-             VALUES
-                ($1, $2, $3,
-                    $4, $5, $6)
-             RETURNING
-                {ID}
-            "
-        );
         let id: i32 = query_scalar(QUERY_VIDEO_INFO)
             .bind(&video_info.video_id)
             .bind(&video_info.title)
@@ -110,15 +118,8 @@ impl Database<Sqlite> {
             .await?;
 
         // Insertion(s) into video_format table
-        const QUERY_VIDEO_FORMAT: &str = formatcp!(
-            "INSERT INTO {VIDEO_FORMAT}
-                ({CONTAINER}, {WIDTH}, {HEIGHT}, {FPS}, {VIDEO_INFO_ID})
-             VALUES
-                ($1, $2, $3, $4, $5)
-            "
-        );
         for video_format in &video_info.video_formats {
-            query(&QUERY_VIDEO_FORMAT)
+            query(QUERY_VIDEO_FORMAT)
                 .bind(&video_format.container)
                 .bind(&video_format.width)
                 .bind(&video_format.height)
@@ -133,34 +134,51 @@ impl Database<Sqlite> {
         Ok(id)
     }
 
-    pub async fn bulk_insert_video_info(&self, video_info: &Vec<VideoInfo>) -> sqlxResult<Vec<i32>> {
+    pub async fn bulk_insert_video_info(
+        &self,
+        video_infos: &Vec<VideoInfo>,
+    ) -> sqlxResult<Vec<i32>> {
         let mut transaction = self.get_transaction().await?;
 
-        todo!();
+        let mut res = Vec::with_capacity(video_infos.len());
+        for video_info in video_infos {
+            let id: i32 = query_scalar(QUERY_VIDEO_INFO)
+                .bind(&video_info.video_id)
+                .bind(&video_info.title)
+                .bind(&video_info.author)
+                .bind(&video_info.duration_seconds)
+                .bind(&video_info.thumbnail)
+                .bind(&video_info.audio_available)
+                .fetch_one(&mut *transaction)
+                .await?;
+            for video_format in &video_info.video_formats {
+                query(QUERY_VIDEO_FORMAT)
+                    .bind(&video_format.container)
+                    .bind(&video_format.width)
+                    .bind(&video_format.height)
+                    .bind(&video_format.fps)
+                    .bind(&id)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            res.push(id);
+        }
 
         transaction.commit().await?;
 
+        Ok(res)
     }
 
     pub async fn delete_video_info(&self, id: &i32) -> sqlxResult<u64> {
-        const QUERY: &str = formatcp!(
-            "DELETE FROM {VIDEO_INFO} WHERE {ID} = $1"
-        );
-        let result = query(QUERY)
-            .bind(&id)
-            .execute(&self.pool)
-            .await?;
-        
+        const QUERY: &str = formatcp!("DELETE FROM {VIDEO_INFO} WHERE {ID} = $1");
+        let result = query(QUERY).bind(&id).execute(&self.pool).await?;
+
         Ok(result.rows_affected())
     }
 
-    pub async fn delete_all(&self) ->sqlxResult<u64> {
-        const QUERY: &str = formatcp!(
-            "DELETE FROM {VIDEO_INFO}"
-        );
-        let result = query(QUERY)
-            .execute(&self.pool)
-            .await?;
+    pub async fn delete_all(&self) -> sqlxResult<u64> {
+        const QUERY: &str = formatcp!("DELETE FROM {VIDEO_INFO}");
+        let result = query(QUERY).execute(&self.pool).await?;
 
         Ok(result.rows_affected())
     }
@@ -195,36 +213,82 @@ mod tests {
         Ok(migrate!().run(&pool).await?)
     }
 
-    fn get_example_video_info() -> VideoInfo {
-        VideoInfo {
-            video_id: "lY2yjAdbvdQ".to_string(),
-            title: "Shawn Mendes - Treat You Better".to_string(),
-            author: "Shawn Mendes".to_string(),
-            duration_seconds: "256".to_string(),
-            thumbnail: None,
-            video_formats: vec![
-                VideoFormat {
-                    container: "webm".to_string(),
-                    width: "360".to_string(),
-                    height: "480".to_string(),
-                    fps: "60".to_string(),
-                },
-                VideoFormat {
-                    container: "mp4".to_string(),
-                    width: "1280".to_string(),
-                    height: "720".to_string(),
-                    fps: "120".to_string(),
-                },
-            ],
-            audio_available: true,
-        }
+    fn get_test_videos() -> Vec<VideoInfo> {
+        vec![
+            VideoInfo {
+                video_id: "id1".to_string(),
+                title: "Video 1".to_string(),
+                author: "Author 1".to_string(),
+                duration_seconds: "1".to_string(),
+                thumbnail: None,
+                video_formats: vec![
+                    VideoFormat {
+                        container: "webm".to_string(),
+                        width: "640".to_string(),
+                        height: "480".to_string(),
+                        fps: "30".to_string(),
+                    },
+                    VideoFormat {
+                        container: "mp4".to_string(),
+                        width: "1280".to_string(),
+                        height: "720".to_string(),
+                        fps: "60".to_string(),
+                    },
+                ],
+                audio_available: true,
+            },
+            VideoInfo {
+                video_id: "id2".to_string(),
+                title: "Video 2".to_string(),
+                author: "Author 2".to_string(),
+                duration_seconds: "2".to_string(),
+                thumbnail: None,
+                video_formats: vec![
+                    VideoFormat {
+                        container: "webm".to_string(),
+                        width: "640".to_string(),
+                        height: "480".to_string(),
+                        fps: "30".to_string(),
+                    },
+                    VideoFormat {
+                        container: "mp4".to_string(),
+                        width: "1280".to_string(),
+                        height: "720".to_string(),
+                        fps: "60".to_string(),
+                    },
+                ],
+                audio_available: false,
+            },
+            VideoInfo {
+                video_id: "id2".to_string(),
+                title: "Video 3".to_string(),
+                author: "Author 3".to_string(),
+                duration_seconds: "3".to_string(),
+                thumbnail: None,
+                video_formats: vec![
+                    VideoFormat {
+                        container: "webm".to_string(),
+                        width: "640".to_string(),
+                        height: "480".to_string(),
+                        fps: "30".to_string(),
+                    },
+                    VideoFormat {
+                        container: "mp4".to_string(),
+                        width: "1280".to_string(),
+                        height: "720".to_string(),
+                        fps: "60".to_string(),
+                    },
+                ],
+                audio_available: true,
+            },
+        ]
     }
 
     #[sqlx::test]
     async fn insert_one(pool: SqlitePool) {
         let db = Database { pool };
 
-        let video_info = get_example_video_info();
+        let video_info = &get_test_videos()[0];
         let id = db.insert_video_info(&video_info).await.unwrap();
 
         assert_eq!(id, 1);
@@ -234,10 +298,10 @@ mod tests {
     async fn insert_two_delete_one(pool: SqlitePool) {
         let db = Database { pool };
 
-        let video_info = get_example_video_info();
+        let video_infos = get_test_videos();
 
-        let _ = db.insert_video_info(&video_info).await.unwrap();
-        let id = db.insert_video_info(&video_info).await.unwrap();
+        let _ = db.insert_video_info(&video_infos[0]).await.unwrap();
+        let id = db.insert_video_info(&video_infos[1]).await.unwrap();
 
         let deletions = db.delete_video_info(&id).await.unwrap();
 
@@ -257,7 +321,7 @@ mod tests {
     async fn insert_many_delete_nonexisting(pool: SqlitePool) {
         let db = Database { pool };
 
-        let video_info = get_example_video_info();
+        let video_info = &get_test_videos()[0];
 
         for _ in 0..4 {
             db.insert_video_info(&video_info).await.unwrap();
@@ -266,5 +330,20 @@ mod tests {
         let deletions = db.delete_video_info(&5).await.unwrap();
 
         assert_eq!(deletions, 0);
+    }
+
+    #[sqlx::test]
+    async fn bulk_insert(pool: SqlitePool) {
+        let db = Database {pool};
+
+        let video_infos = get_test_videos();
+        let ids = db.bulk_insert_video_info(&video_infos).await.unwrap();
+
+        assert_eq!(video_infos.len(), ids.len());
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(*id as usize, i+1);
+        }
+
+        panic!();
     }
 }
