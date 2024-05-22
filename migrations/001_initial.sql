@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS video_info (
     author TEXT NOT NULL,
     duration_seconds TEXT NOT NULL,
     thumbnail TEXT,
-    audio_available BOOLEAN NOT NULL,
+    audio_available BOOLEAN NOT NULL
 );
 
 -- Create the video_format table
