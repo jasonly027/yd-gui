@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use const_format::formatcp;
 use sqlx::{migrate::MigrateError, sqlite::SqliteConnectOptions, Result as sqlxResult, *};
 
-use crate::video::VideoInfo;
+use crate::video::{ManagedVideo, VideoInfo};
 
 pub struct Database<DB: sqlx::database::Database> {
     pool: Pool<DB>,
@@ -103,6 +103,33 @@ const QUERY_VIDEO_FORMAT: &str = formatcp!(
 );
 
 impl Database<Sqlite> {
+    pub async fn fetch_one(&self, id: i32) -> sqlxResult<ManagedVideo> {
+        const QUERY_FETCH_ONE_VIDEO_INFO: &str = formatcp!(
+            "SELECT {VIDEO_ID}, {TITLE}, {AUTHOR},
+                {DURATION_SECONDS}, {THUMBNAIL}, {AUDIO_AVAILABLE}
+             FROM {VIDEO_INFO}
+             WHERE {ID} = $1
+            "
+        );
+        let mut video_info: VideoInfo = query_as(QUERY_FETCH_ONE_VIDEO_INFO)
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+
+        const QUERY_FETCH_ONE_VIDEO_FORMATS: &str = formatcp!(
+            "SELECT {CONTAINER}, {WIDTH}, {HEIGHT}, {FPS}, {VIDEO_INFO_ID}
+             FROM {VIDEO_FORMAT}
+             WHERE {VIDEO_INFO_ID} = $1
+            "
+        );
+        video_info.video_formats = query_as(QUERY_FETCH_ONE_VIDEO_FORMATS)
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(ManagedVideo::new(id, video_info))
+    }
+
     pub async fn insert_video_info(&self, video_info: &VideoInfo) -> sqlxResult<i32> {
         let mut transaction = self.get_transaction().await?;
 
@@ -113,7 +140,7 @@ impl Database<Sqlite> {
             .bind(&video_info.author)
             .bind(&video_info.duration_seconds)
             .bind(&video_info.thumbnail)
-            .bind(&video_info.audio_available)
+            .bind(video_info.audio_available)
             .fetch_one(&mut *transaction)
             .await?;
 
@@ -124,7 +151,7 @@ impl Database<Sqlite> {
                 .bind(&video_format.width)
                 .bind(&video_format.height)
                 .bind(&video_format.fps)
-                .bind(&id)
+                .bind(id)
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -148,7 +175,7 @@ impl Database<Sqlite> {
                 .bind(&video_info.author)
                 .bind(&video_info.duration_seconds)
                 .bind(&video_info.thumbnail)
-                .bind(&video_info.audio_available)
+                .bind(video_info.audio_available)
                 .fetch_one(&mut *transaction)
                 .await?;
             for video_format in &video_info.video_formats {
@@ -157,7 +184,7 @@ impl Database<Sqlite> {
                     .bind(&video_format.width)
                     .bind(&video_format.height)
                     .bind(&video_format.fps)
-                    .bind(&id)
+                    .bind(id)
                     .execute(&mut *transaction)
                     .await?;
             }
@@ -169,9 +196,9 @@ impl Database<Sqlite> {
         Ok(res)
     }
 
-    pub async fn delete_video_info(&self, id: &i32) -> sqlxResult<u64> {
+    pub async fn delete_video_info(&self, id: i32) -> sqlxResult<u64> {
         const QUERY: &str = formatcp!("DELETE FROM {VIDEO_INFO} WHERE {ID} = $1");
-        let result = query(QUERY).bind(&id).execute(&self.pool).await?;
+        let result = query(QUERY).bind(id).execute(&self.pool).await?;
 
         Ok(result.rows_affected())
     }
@@ -260,7 +287,7 @@ mod tests {
                 audio_available: false,
             },
             VideoInfo {
-                video_id: "id2".to_string(),
+                video_id: "id3".to_string(),
                 title: "Video 3".to_string(),
                 author: "Author 3".to_string(),
                 duration_seconds: "3".to_string(),
@@ -285,65 +312,127 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn fetch_one(pool: SqlitePool) {
+        let db = Database { pool };
+
+        let test_video = &get_test_videos()[0];
+
+        let id = db.insert_video_info(test_video).await.unwrap();
+
+        let db_video = db.fetch_one(id).await.unwrap();
+
+        assert_eq!(db_video.get_info(), test_video);
+    }
+
+    #[sqlx::test]
     async fn insert_one(pool: SqlitePool) {
         let db = Database { pool };
 
-        let video_info = &get_test_videos()[0];
-        let id = db.insert_video_info(&video_info).await.unwrap();
+        let test_video = &get_test_videos()[0];
+        let id = db.insert_video_info(test_video).await.unwrap();
 
+        // Check primary key id
         assert_eq!(id, 1);
+
+        // Check video_info
+        let db_video = db.fetch_one(id).await.unwrap();
+        assert_eq!(db_video.get_info(), test_video);
     }
 
     #[sqlx::test]
     async fn insert_two_delete_one(pool: SqlitePool) {
         let db = Database { pool };
 
-        let video_infos = get_test_videos();
+        let test_videos = get_test_videos();
 
-        let _ = db.insert_video_info(&video_infos[0]).await.unwrap();
-        let id = db.insert_video_info(&video_infos[1]).await.unwrap();
+        let first_id = db.insert_video_info(&test_videos[0]).await.unwrap();
+        let second_id = db.insert_video_info(&test_videos[1]).await.unwrap();
 
-        let deletions = db.delete_video_info(&id).await.unwrap();
+        // Check primary key ids
+        assert_eq!(first_id, 1);
+        assert_eq!(second_id, 2);
 
-        assert_eq!(deletions, 1);
-    }
+        // Check video_infos
+        let first_video = db.fetch_one(first_id).await.unwrap();
+        let second_video = db.fetch_one(second_id).await.unwrap();
 
-    #[sqlx::test]
-    async fn delete_one_on_empty_db(pool: SqlitePool) {
-        let db = Database { pool };
+        assert_eq!(&test_videos[0], first_video.get_info());
+        assert_eq!(&test_videos[1], second_video.get_info());
 
-        let deletions = db.delete_video_info(&1).await.unwrap();
-
-        assert_eq!(deletions, 0);
-    }
-
-    #[sqlx::test]
-    async fn insert_many_delete_nonexisting(pool: SqlitePool) {
-        let db = Database { pool };
-
-        let video_info = &get_test_videos()[0];
-
-        for _ in 0..4 {
-            db.insert_video_info(&video_info).await.unwrap();
-        }
-
-        let deletions = db.delete_video_info(&5).await.unwrap();
-
-        assert_eq!(deletions, 0);
+        // Check successful deletion
+        let rows_deleted = db.delete_video_info(first_id).await.unwrap();
+        assert_eq!(rows_deleted, 1);
     }
 
     #[sqlx::test]
     async fn bulk_insert(pool: SqlitePool) {
         let db = Database {pool};
 
-        let video_infos = get_test_videos();
-        let ids = db.bulk_insert_video_info(&video_infos).await.unwrap();
+        let test_videos = get_test_videos();
+        let ids = db.bulk_insert_video_info(&test_videos).await.unwrap();
 
-        assert_eq!(video_infos.len(), ids.len());
+        // Check primary key ids
+        assert_eq!(test_videos.len(), ids.len());
         for (i, id) in ids.iter().enumerate() {
             assert_eq!(*id as usize, i+1);
         }
 
-        panic!();
+        // Fetch videos
+        let mut db_videos = Vec::new();
+        for id in ids {
+            let managed_video = db.fetch_one(id).await.unwrap();
+            db_videos.push(managed_video);
+        }
+
+        // Check video_infos
+        for (i, vid) in db_videos.iter().enumerate() {
+            assert_eq!(vid.get_info(), &test_videos[i])
+        }
+    }
+
+    #[sqlx::test]
+    async fn delete_one_on_empty_db(pool: SqlitePool) {
+        let db = Database { pool };
+
+        let deletions = db.delete_video_info(1).await.unwrap();
+
+        assert_eq!(
+            deletions, 0,
+            "There should be no deletion because there is nothing in the database to delete"
+        );
+    }
+
+    #[sqlx::test]
+    async fn insert_many_delete_nonexisting(pool: SqlitePool) {
+        let db = Database { pool };
+
+        let test_video = &get_test_videos()[0];
+
+        for _ in 0..4 {
+            db.insert_video_info(test_video).await.unwrap();
+        }
+
+        let deletions = db.delete_video_info(5).await.unwrap();
+
+        assert_eq!(
+            deletions, 0,
+            "There should be no deletion because the id targeted is one more than the greatest id"
+        );
+    }
+
+    #[sqlx::test]
+    async fn delete_all(pool: SqlitePool) {
+        let db = Database { pool };
+
+        let test_videos = get_test_videos();
+        let ids = db.bulk_insert_video_info(&test_videos).await.unwrap();
+
+        let rows_deleted = db.delete_all().await.unwrap();
+
+        assert_eq!(
+            ids.len() as u64,
+            rows_deleted,
+            "The number of deleted rows should be equal to the number of videos inserted"
+        );
     }
 }
