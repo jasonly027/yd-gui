@@ -1,7 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use const_format::formatcp;
-use sqlx::{migrate::MigrateError, sqlite::SqliteConnectOptions, Result as sqlxResult, *};
+use sqlx::{
+    migrate::MigrateError,
+    sqlite::{SqliteConnectOptions, SqliteRow},
+    Result as sqlxResult, *,
+};
 
 use crate::video::{ManagedVideo, VideoInfo};
 
@@ -97,37 +101,95 @@ const QUERY_VIDEO_INFO: &str = formatcp!(
 const QUERY_VIDEO_FORMAT: &str = formatcp!(
     "INSERT INTO {VIDEO_FORMAT}
         ({CONTAINER}, {WIDTH}, {HEIGHT}, {FPS}, {VIDEO_INFO_ID})
-        VALUES
+     VALUES
         ($1, $2, $3, $4, $5)
     "
 );
 
+const QUERY_FETCH_ONE_VIDEO_INFO: &str = formatcp!(
+    "SELECT {VIDEO_ID}, {TITLE}, {AUTHOR},
+        {DURATION_SECONDS}, {THUMBNAIL}, {AUDIO_AVAILABLE}
+     FROM {VIDEO_INFO}
+     WHERE {ID} = $1
+    "
+);
+
+const QUERY_FETCH_ONE_VIDEO_FORMATS: &str = formatcp!(
+    "SELECT {CONTAINER}, {WIDTH}, {HEIGHT}, {FPS}, {VIDEO_INFO_ID}
+     FROM {VIDEO_FORMAT}
+     WHERE {VIDEO_INFO_ID} = $1
+    "
+);
+
+const QUERY_FETCH_CHUNK_VIDEO_INFO: &str = formatcp!(
+    "SELECT {ID}, {VIDEO_ID}, {TITLE}, {AUTHOR},
+        {DURATION_SECONDS}, {THUMBNAIL}, {AUDIO_AVAILABLE}
+     FROM {VIDEO_INFO}
+     WHERE {ID} >= $1
+     ORDER BY {ID}
+     LIMIT $2
+    "
+);
+
+pub struct IdAndInfo(i32, VideoInfo);
+impl FromRow<'_, SqliteRow> for IdAndInfo {
+    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
+        Ok(Self(
+            row.try_get("id")?,
+            VideoInfo {
+                video_id: row.try_get("video_id")?,
+                title: row.try_get("title")?,
+                author: row.try_get("author")?,
+                duration_seconds: row.try_get("duration_seconds")?,
+                thumbnail: row.try_get("thumbnail")?,
+                video_formats: Vec::default(),
+                audio_available: row.try_get("audio_available")?,
+            },
+        ))
+    }
+}
+
 impl Database<Sqlite> {
     pub async fn fetch_one(&self, id: i32) -> sqlxResult<ManagedVideo> {
-        const QUERY_FETCH_ONE_VIDEO_INFO: &str = formatcp!(
-            "SELECT {VIDEO_ID}, {TITLE}, {AUTHOR},
-                {DURATION_SECONDS}, {THUMBNAIL}, {AUDIO_AVAILABLE}
-             FROM {VIDEO_INFO}
-             WHERE {ID} = $1
-            "
-        );
         let mut video_info: VideoInfo = query_as(QUERY_FETCH_ONE_VIDEO_INFO)
             .bind(id)
             .fetch_one(&self.pool)
             .await?;
 
-        const QUERY_FETCH_ONE_VIDEO_FORMATS: &str = formatcp!(
-            "SELECT {CONTAINER}, {WIDTH}, {HEIGHT}, {FPS}, {VIDEO_INFO_ID}
-             FROM {VIDEO_FORMAT}
-             WHERE {VIDEO_INFO_ID} = $1
-            "
-        );
         video_info.video_formats = query_as(QUERY_FETCH_ONE_VIDEO_FORMATS)
             .bind(id)
             .fetch_all(&self.pool)
             .await?;
 
         Ok(ManagedVideo::new(id, video_info))
+    }
+
+    pub async fn fetch_chunk_of(
+        &self,
+        starting_id: i32,
+        num_entries: u32,
+    ) -> sqlxResult<Vec<ManagedVideo>> {
+        let id_and_infos: Vec<IdAndInfo> = query_as(QUERY_FETCH_CHUNK_VIDEO_INFO)
+            .bind(starting_id)
+            .bind(num_entries)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut managed_videos = Vec::new();
+        for IdAndInfo(id, mut video_info) in id_and_infos {
+            video_info.video_formats = query_as(QUERY_FETCH_ONE_VIDEO_FORMATS)
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?;
+            let managed_video = ManagedVideo::new(id, video_info);
+            managed_videos.push(managed_video);
+        }
+
+        Ok(managed_videos)
+    }
+
+    pub async fn fetch_chunk(&self, starting_id: i32) -> sqlxResult<Vec<ManagedVideo>> {
+        self.fetch_chunk_of(starting_id, 20).await
     }
 
     pub async fn insert_video_info(&self, video_info: &VideoInfo) -> sqlxResult<i32> {
@@ -161,7 +223,7 @@ impl Database<Sqlite> {
         Ok(id)
     }
 
-    pub async fn bulk_insert_video_info(
+    pub async fn insert_bulk_video_info(
         &self,
         video_infos: &Vec<VideoInfo>,
     ) -> sqlxResult<Vec<i32>> {
@@ -213,7 +275,7 @@ impl Database<Sqlite> {
 
 #[cfg(test)]
 mod tests {
-    use crate::video::{VideoFormat, VideoInfo};
+    use crate::video::{ManagedVideo, VideoFormat, VideoInfo};
 
     use super::Database;
     use anyhow::{Ok, Result};
@@ -325,6 +387,44 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn fetch_chunk_of(pool: SqlitePool) {
+        let db = Database { pool };
+
+        let test_videos = get_test_videos();
+
+        db.insert_bulk_video_info(&test_videos).await.unwrap();
+
+        let db_videos: Vec<VideoInfo> = db
+            .fetch_chunk_of(1, test_videos.len() as u32)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(ManagedVideo::into)
+            .collect();
+
+        assert_eq!(db_videos, test_videos);
+    }
+
+    #[sqlx::test]
+    async fn fetch_chunk(pool: SqlitePool) {
+        let db = Database { pool };
+
+        let test_videos = get_test_videos();
+
+        db.insert_bulk_video_info(&test_videos).await.unwrap();
+
+        let db_videos: Vec<VideoInfo> = db
+            .fetch_chunk(1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(ManagedVideo::into)
+            .collect();
+
+        assert_eq!(db_videos, test_videos);
+    }
+
+    #[sqlx::test]
     async fn insert_one(pool: SqlitePool) {
         let db = Database { pool };
 
@@ -366,15 +466,15 @@ mod tests {
 
     #[sqlx::test]
     async fn bulk_insert(pool: SqlitePool) {
-        let db = Database {pool};
+        let db = Database { pool };
 
         let test_videos = get_test_videos();
-        let ids = db.bulk_insert_video_info(&test_videos).await.unwrap();
+        let ids = db.insert_bulk_video_info(&test_videos).await.unwrap();
 
         // Check primary key ids
         assert_eq!(test_videos.len(), ids.len());
         for (i, id) in ids.iter().enumerate() {
-            assert_eq!(*id as usize, i+1);
+            assert_eq!(*id as usize, i + 1);
         }
 
         // Fetch videos
@@ -425,7 +525,7 @@ mod tests {
         let db = Database { pool };
 
         let test_videos = get_test_videos();
-        let ids = db.bulk_insert_video_info(&test_videos).await.unwrap();
+        let ids = db.insert_bulk_video_info(&test_videos).await.unwrap();
 
         let rows_deleted = db.delete_all().await.unwrap();
 
