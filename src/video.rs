@@ -28,13 +28,19 @@ pub struct ManagedVideo {
     downloading: Arc<AtomicBool>,
 }
 
+impl From<ManagedVideo> for VideoInfo {
+    fn from(value: ManagedVideo) -> Self {
+        value.video_info
+    }
+}
+
 impl ManagedVideo {
     pub fn new(id: i32, video_info: VideoInfo) -> Self {
         Self {
             id,
             video_info,
             content_size: None,
-            downloading: Arc::new(AtomicBool::new(false))
+            downloading: Arc::new(AtomicBool::new(false)),
         }
     }
 
