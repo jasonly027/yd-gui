@@ -87,7 +87,7 @@ const HEIGHT: &str = "height";
 const FPS: &str = "fps";
 const VIDEO_INFO_ID: &str = "video_info_id";
 
-const QUERY_VIDEO_INFO: &str = formatcp!(
+const QUERY_INSERT_INFO: &str = formatcp!(
     "INSERT INTO {VIDEO_INFO}
         ({VIDEO_ID}, {TITLE}, {AUTHOR},
             {DURATION_SECONDS}, {THUMBNAIL}, {AUDIO_AVAILABLE})
@@ -98,7 +98,7 @@ const QUERY_VIDEO_INFO: &str = formatcp!(
         {ID}
     "
 );
-const QUERY_VIDEO_FORMAT: &str = formatcp!(
+const QUERY_INSERT_FORMAT: &str = formatcp!(
     "INSERT INTO {VIDEO_FORMAT}
         ({CONTAINER}, {WIDTH}, {HEIGHT}, {FPS}, {VIDEO_INFO_ID})
      VALUES
@@ -106,7 +106,7 @@ const QUERY_VIDEO_FORMAT: &str = formatcp!(
     "
 );
 
-const QUERY_FETCH_ONE_VIDEO_INFO: &str = formatcp!(
+const QUERY_FETCH_ONE_INFO: &str = formatcp!(
     "SELECT {VIDEO_ID}, {TITLE}, {AUTHOR},
         {DURATION_SECONDS}, {THUMBNAIL}, {AUDIO_AVAILABLE}
      FROM {VIDEO_INFO}
@@ -114,19 +114,29 @@ const QUERY_FETCH_ONE_VIDEO_INFO: &str = formatcp!(
     "
 );
 
-const QUERY_FETCH_ONE_VIDEO_FORMATS: &str = formatcp!(
+const QUERY_FETCH_ONE_FORMATS: &str = formatcp!(
     "SELECT {CONTAINER}, {WIDTH}, {HEIGHT}, {FPS}, {VIDEO_INFO_ID}
      FROM {VIDEO_FORMAT}
      WHERE {VIDEO_INFO_ID} = $1
     "
 );
 
-const QUERY_FETCH_CHUNK_VIDEO_INFO: &str = formatcp!(
+const QUERY_FETCH_CHUNK_INFO_GEQ: &str = formatcp!(
     "SELECT {ID}, {VIDEO_ID}, {TITLE}, {AUTHOR},
         {DURATION_SECONDS}, {THUMBNAIL}, {AUDIO_AVAILABLE}
      FROM {VIDEO_INFO}
      WHERE {ID} >= $1
-     ORDER BY {ID}
+     ORDER BY {ID} ASC
+     LIMIT $2
+    "
+);
+
+const QUERY_FETCH_CHUNK_INFO_LEQ: &str = formatcp!(
+    "SELECT {ID}, {VIDEO_ID}, {TITLE}, {AUTHOR},
+        {DURATION_SECONDS}, {THUMBNAIL}, {AUDIO_AVAILABLE}
+     FROM {VIDEO_INFO}
+     WHERE {ID} <= $1
+     ORDER BY {ID} DESC
      LIMIT $2
     "
 );
@@ -135,28 +145,34 @@ pub struct IdAndInfo(i32, VideoInfo);
 impl FromRow<'_, SqliteRow> for IdAndInfo {
     fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
         Ok(Self(
-            row.try_get("id")?,
+            row.try_get(ID)?,
             VideoInfo {
-                video_id: row.try_get("video_id")?,
-                title: row.try_get("title")?,
-                author: row.try_get("author")?,
-                duration_seconds: row.try_get("duration_seconds")?,
-                thumbnail: row.try_get("thumbnail")?,
+                video_id: row.try_get(VIDEO_ID)?,
+                title: row.try_get(TITLE)?,
+                author: row.try_get(AUTHOR)?,
+                duration_seconds: row.try_get(DURATION_SECONDS)?,
+                thumbnail: row.try_get(THUMBNAIL)?,
                 video_formats: Vec::default(),
-                audio_available: row.try_get("audio_available")?,
+                audio_available: row.try_get(AUDIO_AVAILABLE)?,
             },
         ))
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum FetchOrd {
+    GEQandASC,
+    LEQandDESC,
+}
+
 impl Database<Sqlite> {
     pub async fn fetch_one(&self, id: i32) -> sqlxResult<ManagedVideo> {
-        let mut video_info: VideoInfo = query_as(QUERY_FETCH_ONE_VIDEO_INFO)
+        let mut video_info: VideoInfo = query_as(QUERY_FETCH_ONE_INFO)
             .bind(id)
             .fetch_one(&self.pool)
             .await?;
 
-        video_info.video_formats = query_as(QUERY_FETCH_ONE_VIDEO_FORMATS)
+        video_info.video_formats = query_as(QUERY_FETCH_ONE_FORMATS)
             .bind(id)
             .fetch_all(&self.pool)
             .await?;
@@ -168,16 +184,20 @@ impl Database<Sqlite> {
         &self,
         starting_id: i32,
         num_entries: u32,
+        ord: FetchOrd,
     ) -> sqlxResult<Vec<ManagedVideo>> {
-        let id_and_infos: Vec<IdAndInfo> = query_as(QUERY_FETCH_CHUNK_VIDEO_INFO)
-            .bind(starting_id)
-            .bind(num_entries)
-            .fetch_all(&self.pool)
-            .await?;
+        let id_and_infos: Vec<IdAndInfo> = query_as(match ord {
+            FetchOrd::GEQandASC => QUERY_FETCH_CHUNK_INFO_GEQ,
+            FetchOrd::LEQandDESC => QUERY_FETCH_CHUNK_INFO_LEQ,
+        })
+        .bind(starting_id)
+        .bind(num_entries)
+        .fetch_all(&self.pool)
+        .await?;
 
         let mut managed_videos = Vec::new();
         for IdAndInfo(id, mut video_info) in id_and_infos {
-            video_info.video_formats = query_as(QUERY_FETCH_ONE_VIDEO_FORMATS)
+            video_info.video_formats = query_as(QUERY_FETCH_ONE_FORMATS)
                 .bind(id)
                 .fetch_all(&self.pool)
                 .await?;
@@ -188,15 +208,51 @@ impl Database<Sqlite> {
         Ok(managed_videos)
     }
 
-    pub async fn fetch_chunk(&self, starting_id: i32) -> sqlxResult<Vec<ManagedVideo>> {
-        self.fetch_chunk_of(starting_id, 20).await
+    pub async fn fetch_chunk(
+        &self,
+        starting_id: i32,
+        ord: FetchOrd,
+    ) -> sqlxResult<Vec<ManagedVideo>> {
+        self.fetch_chunk_of(starting_id, 20, ord).await
+    }
+
+    pub async fn fetch_first_chunk_from_top(&self) -> sqlxResult<Vec<ManagedVideo>> {
+        self.fetch_chunk(1, FetchOrd::GEQandASC).await
+    }
+
+    pub async fn fetch_first_chunk_from_bottom(&self) -> sqlxResult<Vec<ManagedVideo>> {
+        const QUERY_FETCH_CHUNK_INFO_BOTTOM: &str = formatcp!(
+            "SELECT {ID}, {VIDEO_ID}, {TITLE}, {AUTHOR},
+                {DURATION_SECONDS}, {THUMBNAIL}, {AUDIO_AVAILABLE}
+             FROM {VIDEO_INFO}
+             ORDER BY {ID} DESC
+             LIMIT $1
+            "
+        );
+        const NUM_ENTRIES: u32 = 20;
+        let id_and_infos: Vec<IdAndInfo> = query_as(QUERY_FETCH_CHUNK_INFO_BOTTOM)
+            .bind(NUM_ENTRIES)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut managed_videos = Vec::new();
+        for IdAndInfo(id, mut video_info) in id_and_infos {
+            video_info.video_formats = query_as(QUERY_FETCH_ONE_FORMATS)
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?;
+            let managed_video = ManagedVideo::new(id, video_info);
+            managed_videos.push(managed_video);
+        }
+
+        Ok(managed_videos)
     }
 
     pub async fn insert_video_info(&self, video_info: &VideoInfo) -> sqlxResult<i32> {
         let mut transaction = self.get_transaction().await?;
 
         // Insertion into video_info table
-        let id: i32 = query_scalar(QUERY_VIDEO_INFO)
+        let id: i32 = query_scalar(QUERY_INSERT_INFO)
             .bind(&video_info.video_id)
             .bind(&video_info.title)
             .bind(&video_info.author)
@@ -208,7 +264,7 @@ impl Database<Sqlite> {
 
         // Insertion(s) into video_format table
         for video_format in &video_info.video_formats {
-            query(QUERY_VIDEO_FORMAT)
+            query(QUERY_INSERT_FORMAT)
                 .bind(&video_format.container)
                 .bind(&video_format.width)
                 .bind(&video_format.height)
@@ -231,7 +287,7 @@ impl Database<Sqlite> {
 
         let mut res = Vec::with_capacity(video_infos.len());
         for video_info in video_infos {
-            let id: i32 = query_scalar(QUERY_VIDEO_INFO)
+            let id: i32 = query_scalar(QUERY_INSERT_INFO)
                 .bind(&video_info.video_id)
                 .bind(&video_info.title)
                 .bind(&video_info.author)
@@ -241,7 +297,7 @@ impl Database<Sqlite> {
                 .fetch_one(&mut *transaction)
                 .await?;
             for video_format in &video_info.video_formats {
-                query(QUERY_VIDEO_FORMAT)
+                query(QUERY_INSERT_FORMAT)
                     .bind(&video_format.container)
                     .bind(&video_format.width)
                     .bind(&video_format.height)
@@ -275,7 +331,10 @@ impl Database<Sqlite> {
 
 #[cfg(test)]
 mod tests {
-    use crate::video::{ManagedVideo, VideoFormat, VideoInfo};
+    use crate::{
+        database::FetchOrd,
+        video::{ManagedVideo, VideoFormat, VideoInfo},
+    };
 
     use super::Database;
     use anyhow::{Ok, Result};
@@ -395,7 +454,7 @@ mod tests {
         db.insert_bulk_video_info(&test_videos).await.unwrap();
 
         let db_videos: Vec<VideoInfo> = db
-            .fetch_chunk_of(1, test_videos.len() as u32)
+            .fetch_chunk_of(1, test_videos.len() as u32, FetchOrd::GEQandASC)
             .await
             .unwrap()
             .into_iter()
@@ -414,12 +473,52 @@ mod tests {
         db.insert_bulk_video_info(&test_videos).await.unwrap();
 
         let db_videos: Vec<VideoInfo> = db
-            .fetch_chunk(1)
+            .fetch_chunk(1, FetchOrd::GEQandASC)
             .await
             .unwrap()
             .into_iter()
             .map(ManagedVideo::into)
             .collect();
+
+        assert_eq!(db_videos, test_videos);
+    }
+
+    #[sqlx::test]
+    async fn fetch_first_chunk_from_top(pool: SqlitePool) {
+        let db = Database { pool };
+
+        let test_videos = get_test_videos();
+
+        db.insert_bulk_video_info(&test_videos).await.unwrap();
+
+        let db_videos: Vec<VideoInfo> = db
+            .fetch_first_chunk_from_top()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(ManagedVideo::into)
+            .collect();
+
+        assert_eq!(db_videos, test_videos);
+    }
+
+    #[sqlx::test]
+    async fn fetch_first_chunk_from_bottom(pool: SqlitePool) {
+        let db = Database { pool };
+
+        let mut test_videos = get_test_videos();
+
+        db.insert_bulk_video_info(&test_videos).await.unwrap();
+
+        let db_videos: Vec<VideoInfo> = db
+            .fetch_first_chunk_from_bottom()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(ManagedVideo::into)
+            .collect();
+
+        test_videos.reverse();
 
         assert_eq!(db_videos, test_videos);
     }
