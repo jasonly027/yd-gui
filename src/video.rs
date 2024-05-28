@@ -1,3 +1,4 @@
+//! Represents information related to a video
 use std::sync::{atomic::AtomicBool, Arc};
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]

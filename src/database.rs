@@ -1,31 +1,34 @@
+//! A database is used to store the history of downloaded videos.
 use std::path::{Path, PathBuf};
 
 use const_format::formatcp;
+pub use sqlx::Result as sqlxResult;
 use sqlx::{
     migrate::MigrateError,
     sqlite::{SqliteConnectOptions, SqliteRow},
-    Result as sqlxResult, *,
+    *,
 };
 
 use crate::video::{ManagedVideo, VideoInfo};
 
+/// Creates a connection to a local SQLite database and offers CRUD operations.
 pub struct Database<DB: sqlx::database::Database> {
     pool: Pool<DB>,
 }
 
 impl Database<Sqlite> {
     /// Initialize the database reading from the SQLite database file
-    /// supplied by [`Self::get_file_path`].
+    /// supplied by [get_file_path](Self::get_file_path).
     ///
     /// If the file does not exist, it will be created.
     ///
-    /// See also [`Self::init_with_filename`]
+    /// See also [init_with_filename](Self::init_with_filename).
     pub async fn init() -> sqlxResult<Self> {
         Self::init_with_filename(Self::get_file_path()?).await
     }
 
     /// Initialize the database reading from the SQLite database file
-    /// at the `path`. [`Self::init`] is most likely what you want to use
+    /// at the `path`. [init](Self::init) is most likely what you want to use
     /// for default behavior.
     ///
     /// If the file does not exist, it will be created.
@@ -45,7 +48,7 @@ impl Database<Sqlite> {
     /// The path is intended to be in the same directory as the executable.
     ///
     /// # Errors
-    /// May fail with an [`std::io::Error`] when getting the path to the
+    /// May fail with an [std::io::Error] when getting the path to the
     /// running executable because it's used to derive the path to the `.db` file.
     pub fn get_file_path() -> std::result::Result<PathBuf, std::io::Error> {
         const FILE_NAME: &str = "history.db";
@@ -57,10 +60,14 @@ impl Database<Sqlite> {
         Ok(path)
     }
 
+    /// Applies SQL migrations to the database.
+    /// This method is already called by the init functions so it is
+    /// unlikely this needs to be called again.
     pub async fn apply_migrations(&self) -> sqlxResult<(), MigrateError> {
         migrate!().run(&self.pool).await
     }
 
+    /// Close the connection to the database
     pub async fn close(self) {
         self.pool.close().await;
     }
@@ -141,7 +148,7 @@ const QUERY_FETCH_CHUNK_INFO_LEQ: &str = formatcp!(
     "
 );
 
-pub struct IdAndInfo(i32, VideoInfo);
+struct IdAndInfo(i32, VideoInfo);
 impl FromRow<'_, SqliteRow> for IdAndInfo {
     fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
         Ok(Self(
@@ -159,13 +166,24 @@ impl FromRow<'_, SqliteRow> for IdAndInfo {
     }
 }
 
+/// Used to specify the ordering of results from the fetch chunk methods.
+/// # See also
+/// - [`fetch_chunk_of`](Database::fetch_chunk_of)
+/// - [`fetch_chunk`](Database::fetch_chunk)
+/// - [`fetch_first_chunk_from_top`](Database::fetch_first_chunk_from_top)
+/// - [`fetch_first_chunk_from_bottom`](Database::fetch_first_chunk_from_bottom)
 #[derive(Debug, Clone, Copy)]
 pub enum FetchOrd {
+    /// Greater than or equal to the `id` passed to the fetch method and
+    /// sorted in ascending order
     GEQandASC,
+    /// Less than or equal to the `id` passed to the fetch method and
+    /// sorted in descending order
     LEQandDESC,
 }
 
 impl Database<Sqlite> {
+    /// Fetch the [ManagedVideo] with matching `id`.
     pub async fn fetch_one(&self, id: i32) -> sqlxResult<ManagedVideo> {
         let mut video_info: VideoInfo = query_as(QUERY_FETCH_ONE_INFO)
             .bind(id)
@@ -180,6 +198,51 @@ impl Database<Sqlite> {
         Ok(ManagedVideo::new(id, video_info))
     }
 
+    /// Fetch a chunk of [ManagedVideo]'s of size `num_entries` beginning
+    /// with an id matching `starting_id`. Use `ord` to specify the direction
+    /// and order of entries following the `starting_id` entry. See [FetchOrd].
+    ///
+    /// This may return less than the specified `num_entries` if the database
+    /// contains less than that number.
+    ///
+    /// # Example
+    /// Consider a database with the following rows and columns:
+    ///
+    /// | id | value |
+    /// | - | - |
+    /// | 1 | a |
+    /// | 2 | b |
+    /// | 3 | c |
+    /// | 4 | d |
+    /// | 5 | e |
+    ///
+    /// ```no_run
+    /// # use yd_gui::database::{*, sqlxResult};
+    /// # use sqlx::Sqlite;
+    /// #
+    /// # async fn example(db: Database<Sqlite>) -> sqlxResult<()> {
+    ///
+    /// // a, b, c, d, e
+    /// db.fetch_chunk_of(1, 5, FetchOrd::GEQandASC).await?;
+    ///
+    /// // a
+    /// db.fetch_chunk_of(1, 5, FetchOrd::LEQandDESC).await?;
+    ///
+    /// // a
+    /// db.fetch_chunk_of(5, 5, FetchOrd::GEQandASC).await?;
+    ///
+    /// // e, d, c, b, a
+    /// db.fetch_chunk_of(5, 5, FetchOrd::LEQandDESC).await?;
+    ///
+    /// // c, d, e
+    /// db.fetch_chunk_of(3, 5, FetchOrd::GEQandASC).await?;
+    ///
+    /// // c, b, a
+    /// db.fetch_chunk_of(3, 5, FetchOrd::LEQandDESC).await?;
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn fetch_chunk_of(
         &self,
         starting_id: i32,
@@ -208,6 +271,10 @@ impl Database<Sqlite> {
         Ok(managed_videos)
     }
 
+    /// Fetch a chunk of [ManagedVideo]'s.
+    ///
+    /// Works exactly like [fetch_chunk_of](Database::fetch_chunk_of) but with
+    /// a default `num_entries` of 20.
     pub async fn fetch_chunk(
         &self,
         starting_id: i32,
@@ -216,10 +283,19 @@ impl Database<Sqlite> {
         self.fetch_chunk_of(starting_id, 20, ord).await
     }
 
+    /// Fetch the first chunk of [ManagedVideo]'s from the top.
+    ///
+    /// Equivalent to using [fetch_chunk(1, FetchOrd::GEQandASC)](Self::fetch_chunk).
+    /// See also [fetch_first_chunk_from_bottom](Self::fetch_first_chunk_from_bottom).
     pub async fn fetch_first_chunk_from_top(&self) -> sqlxResult<Vec<ManagedVideo>> {
         self.fetch_chunk(1, FetchOrd::GEQandASC).await
     }
 
+    /// Fetch the first chunk of [ManagedVideo]'s from the bottom.
+    ///
+    /// Equivalent, *in spirit*, to using
+    /// [fetch_chunk(*\[last id in database\]*, FetchOrd::LEQandDESC)](Self::fetch_chunk).
+    /// See also [fetch_first_chunk_from_top](Self::fetch_first_chunk_from_top).
     pub async fn fetch_first_chunk_from_bottom(&self) -> sqlxResult<Vec<ManagedVideo>> {
         const QUERY_FETCH_CHUNK_INFO_BOTTOM: &str = formatcp!(
             "SELECT {ID}, {VIDEO_ID}, {TITLE}, {AUTHOR},
@@ -248,6 +324,10 @@ impl Database<Sqlite> {
         Ok(managed_videos)
     }
 
+    /// Insert `video_info` into the database.
+    /// Returns the row id of the inserted video.
+    ///
+    /// See also [insert_bulk_video_info](Self::insert_bulk_video_info).
     pub async fn insert_video_info(&self, video_info: &VideoInfo) -> sqlxResult<i32> {
         let mut transaction = self.get_transaction().await?;
 
@@ -279,6 +359,10 @@ impl Database<Sqlite> {
         Ok(id)
     }
 
+    /// Insert `video_infos` into the database.
+    /// Returns the respective row ids of the `video_infos`.
+    ///
+    /// See also [insert_video_info](Self::insert_video_info).
     pub async fn insert_bulk_video_info(
         &self,
         video_infos: &Vec<VideoInfo>,
@@ -314,6 +398,7 @@ impl Database<Sqlite> {
         Ok(res)
     }
 
+    /// Delete the video at the row with the matching row `id`.
     pub async fn delete_video_info(&self, id: i32) -> sqlxResult<u64> {
         const QUERY: &str = formatcp!("DELETE FROM {VIDEO_INFO} WHERE {ID} = $1");
         let result = query(QUERY).bind(id).execute(&self.pool).await?;
@@ -321,6 +406,7 @@ impl Database<Sqlite> {
         Ok(result.rows_affected())
     }
 
+    /// <div class="warning">Deletes all the videos in the database.</div>
     pub async fn delete_all(&self) -> sqlxResult<u64> {
         const QUERY: &str = formatcp!("DELETE FROM {VIDEO_INFO}");
         let result = query(QUERY).execute(&self.pool).await?;
